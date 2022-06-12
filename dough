@@ -1,0 +1,272 @@
+#!/usr/bin/env python
+
+import http
+import requests
+import argparse
+import os
+import os.path as osp
+import re
+import logging
+import base64
+import csv
+
+# http.client.HTTPConnection.debuglevel = 1
+
+DIH_CONFIG_PATH = osp.join(os.environ['HOME'], '.dih')
+
+URL_IANA_DNS_RR_TYPES = 'https://www.iana.org/assignments/dns-parameters/dns-parameters-4.csv'
+
+QCLASS_VALUES = {
+	 'IN':	1
+	,'CH':	3
+	,'HS':	4
+}
+
+SEQID = bytes.fromhex('0000') # random
+REQFLAGS = bytes.fromhex('0100')
+QCOUNT = bytes.fromhex('0001')
+ACOUNT = bytes.fromhex('0000')
+NSCOUNT = bytes.fromhex('0000')
+ARCOUNT = bytes.fromhex('0000')
+
+# TODO: should be able to get qclass (currently only IN)
+def dns_request_payload(qname, qtype):
+	if qname.endswith('.'):
+		qname = qname.rstrip('.')
+
+	# TODO: check the specs of a domain name
+	labels = qname.split('.')
+	label_lengths_bytes = [len(l).to_bytes(1, byteorder='big') for l in labels]
+	labels_bytes = [str.encode(l) for l in labels]
+	qname_bytes = b''.join([x+y for x,y in zip(label_lengths_bytes, labels_bytes)]) + bytes.fromhex('00')
+
+	qtype_bytes = int(qtype).to_bytes(2, byteorder='big')
+
+	qclass_bytes = bytes.fromhex('0001')
+
+	return SEQID + REQFLAGS + QCOUNT + ACOUNT + NSCOUNT + ARCOUNT + \
+		qname_bytes + qtype_bytes + qclass_bytes
+
+class dnsPayload():
+	def __init__(self, wireformat):
+		self.flags = {}
+		self.counts = {}
+		self.questions = []
+		self.answers = []
+		self.authorities = []
+		self.additionals = []
+		self.seqid = int.from_bytes(wireformat[:2], byteorder="big")
+		self.read_flags(wireformat[2:4])
+		self.rcode = wireformat[3] & 15
+		self.read_counts(wireformat[4:12])
+
+		# DNS header of 12 bytes is finished
+		index = 12
+
+		if self.counts['qd']:
+			index = self.read_question(wireformat, index)
+
+		self.rrs = {'an': [], 'ns': [], 'ar': []}
+		for section in self.rrs:
+			index = self.read_resource_records(wireformat, index, section)
+
+	def read_flags(self, header):
+		self.flags['qr'] = (header[0] & 128)>>7
+		self.flags['oc'] = (header[0] & 120)>>3
+		self.flags['aa'] = (header[0] &   4)>>2
+		self.flags['tc'] = (header[0] &   2)>>1
+		self.flags['rd'] = (header[0] &   1)
+		self.flags['ra'] = (header[1] & 128)>>7
+		self.flags['ad'] = (header[1] &  32)>>5
+		self.flags['cd'] = (header[1] &  16)>>4
+
+	def read_counts(self, header):
+		self.counts['qd'] = int.from_bytes(header[:2], byteorder="big")
+		self.counts['an'] = int.from_bytes(header[2:4], byteorder="big")
+		self.counts['ns'] = int.from_bytes(header[4:6], byteorder="big")
+		self.counts['ar'] = int.from_bytes(header[6:], byteorder="big")
+
+	def read_question(self, wireformat, index):
+		num_questions = self.counts['qd']
+		while num_questions:
+			num_questions -= 1
+			question = {'name': '', 'type': 0, 'class': 0}
+			while wireformat[index]:
+				start_index = index + 1
+				end_index = start_index + wireformat[index]
+				question['name'] += wireformat[start_index : end_index].decode('utf-8') + '.'
+				index = end_index
+			index += 1
+			question['type'] = int.from_bytes(wireformat[index : index + 2], byteorder='big')
+			index += 2
+			question['class'] = int.from_bytes(wireformat[index : index + 2], byteorder='big')
+			index += 2
+			self.questions.append(question)
+
+		return index
+
+	def read_domain_name(self, wireformat, index):
+		domain_name = ''
+		while wireformat[index]:
+			if wireformat[index] < 192: # not offset. then check if 63 or below?
+				start_index = index + 1
+				end_index = start_index + wireformat[index]
+				domain_name += wireformat[start_index : end_index].decode('utf-8') + '.'
+				# print(domain_name)
+				index = end_index
+				# print(f"Index is set to {index} and the byte pointed at is {wireformat[index]}")
+			else:
+				offset = int.from_bytes(wireformat[index : index+2], byteorder='big')
+				offset -= int.from_bytes(bytes.fromhex('c000'), byteorder='big')
+				# print(f"Going back to {offset}")
+				decompressed_name, _ = self.read_domain_name(wireformat, offset)
+				index += 1
+				domain_name += decompressed_name
+				# print(f"Index is recalled to {index} and the byte pointed at is {wireformat[index]}")
+				break
+
+		return domain_name, index+1
+
+	def read_int_from_bytes(self, wireformat, index, num_bytes):
+		return int.from_bytes(wireformat[index : index + num_bytes], byteorder='big'), index + num_bytes
+
+	def read_resource_records(self, wireformat, index, section):
+		num_rr = self.counts[section]
+		while num_rr:
+			num_rr -= 1
+
+			resource_record = {'name':     '',
+					  		   'type':     0,
+							   'class':    0,
+							   'ttl':      0,
+							   'rdlength': 0,
+							   'rdata':    b''}
+
+			resource_record['name'], index = self.read_domain_name(wireformat, index)
+
+			rr_field_length = {'type': 2, 'class': 2, 'ttl': 4, 'rdlength': 2}
+			for field in rr_field_length:
+				resource_record[field], index = self.read_int_from_bytes(wireformat, index, rr_field_length[field])
+
+			# Read RDATA considering TYPE
+			if resource_record['type'] in [2, 5, 12]: # NS, CNAME, PTR
+				resource_record['rdata'], index = self.read_domain_name(wireformat, index)
+			elif resource_record['type'] == 1: # A
+				resource_record['rdata'] = '.'.join([str(byte) for byte in wireformat[index : index + 4]])
+				index += 4
+			elif resource_record['type'] == 28: #AAAA
+				resource_record['rdata'] = '.'.join([str(byte) for byte in wireformat[index : index + 16]])
+			else: # Unimplemented TYPEs, just return the byte string
+				resource_record['rdata'] = wireformat[index : index + resource_record['rdlength']]
+				index += resource_record['rdlength']
+				print(f'{resource_record["rdlength"]} bytes of RDATA read')
+
+			# this debugging line is bad because it goes out of bounds for the last record
+			# print(f"Index is set to {index} and the byte pointed at is {wireformat[index]}: END OF ANSWER")
+			self.rrs[section].append(resource_record)
+
+		return index
+
+	def __str__(self):
+		# header info
+		summary = f'\n;; ->>HEADER<<- opcode: {self.flags["oc"]}, status: {self.rcode}, id: {self.seqid}'
+		summary += f'\n;; flags: {" ".join([key for key in self.flags if self.flags[key] == 1])}; QUERY: {self.counts["qd"]}, ANSWER: {self.counts["an"]}, AUTHORITY: {self.counts["ns"]}, ADDITIONAL: {self.counts["ar"]}\n'
+
+		# question
+		summary += '\n;; QUESTION SECTION:'
+		for i in range(self.counts['qd']): # TODO: this is fine but buggy in general
+			summary += f"\n;{self.questions[i]['name']}\t{self.questions[i]['class']}\t{self.questions[i]['type']}"
+		# rrs
+		for section in ['an', 'ns', 'ar']:
+			if section == 'an':
+				summary += "\n;; ANSWER SECTION:"
+			if section == 'ns':
+				summary += "\n;; AUTHORITY SECTION:"
+			if section == 'ar':
+				summary += "\n;; ADDITIONAL SECTION:"
+			for i in range(self.counts[section]):
+				summary += f"\n{self.rrs[section][i]['name']}\t{self.rrs[section][i]['ttl']}\t{self.rrs[section][i]['class']}\t{self.rrs[section][i]['type']}\t{self.rrs[section][i]['rdata']}"
+
+		return summary
+
+
+def default_resolvers():
+	try:
+		with open('/etc/resolv.conf', 'r') as file:
+			content = file.read()
+		return re.findall('\s*nameserver ([0-9a-z\.:]+)', content,
+			flags=re.IGNORECASE)
+	except FileNotFoundError:
+		print('FileNotFoundError: /etc/resolv.conf is missing?!')
+
+def parse_arguments():
+	parser = argparse.ArgumentParser(description='dough: dns-over-https (DoH) lookups.',
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+	parser.add_argument('name', help='QNAME. Name to look up.')
+	parser.add_argument('--type', '-t', type=str, help='QTYPE. Type of query.', default='A')
+	parser.add_argument('--resolver', '-r', action='append', type=str,
+		help='Resolver(s) to forward the query. Must be DoH-compatible.')
+	parser.add_argument('--refresh', action='store_true',
+		help='Refresh canonical DNS parameters from IANA')
+	args = parser.parse_args()
+	if not args.resolver:
+		args.resolver = default_resolvers()
+
+	QTYPES, QTYPE_VALUES = load_config(args.refresh)
+	if args.type not in QTYPE_VALUES: # perhaps a new TYPE, or just a num. value
+		try: # handling num. value case
+			if int(args.type) > 65535 or int(args.type) < 0:
+				ArgumentParser.error('type must either be a valid DNS RR type \
+					or a valid DNS RR type value')
+		except ValueError: # handling new TYPE case
+			argparse.ArgumentTypeError(f'type {args.type} must either be a valid DNS RR type or a valid DNS RR type value')
+	else:
+		args.type = QTYPE_VALUES[args.type]
+
+	return args, QTYPES, QTYPE_VALUES
+
+# dih fetches all DNS parameters from IANA and writes them in $HOME/.dih/
+def load_config(refresh):
+	QTYPES = {}
+	QTYPE_VALUES = {}
+
+	if not osp.isdir(DIH_CONFIG_PATH):
+		os.mkdir(DIH_CONFIG_PATH)
+
+	rr_types_path = osp.join(DIH_CONFIG_PATH, 'rr_types.csv')
+	if refresh or not osp.isfile(rr_types_path):
+		rows = csv.reader(requests.get(URL_IANA_DNS_RR_TYPES).text.split('\n')[1:])
+		with open(rr_types_path, 'w', newline='') as csvfile:
+			writer = csv.writer(csvfile, dialect='unix')
+			for row in rows:
+				if row and row[0].isupper():
+					QTYPES[row[1]] = row[0]
+					QTYPE_VALUES[row[0]] = row[1]
+					writer.writerow(row[:2])
+	else:
+		with open(rr_types_path, 'r') as csvfile:
+			reader = csv.reader(csvfile)
+			for row in reader:
+				QTYPES[row[1]] = row[0]
+				QTYPE_VALUES[row[0]] = row[1]
+
+	return QTYPES, QTYPE_VALUES
+
+def main():
+	args, QTYPES, QTYPE_VALUES = parse_arguments()
+
+	wf = dns_request_payload(args.name, args.type)
+	# then encode in base64 acc. to https://datatracker.ietf.org/doc/html/rfc8484#section-4.1
+	params = {'dns': base64.urlsafe_b64encode(wf)}
+
+	for r in args.resolver:
+		uri = 'https://' + r + '/dns-query'
+		r = requests.get(uri, params=params, verify=True)
+		if r.ok:
+			print(f'Elapsed time: {r.elapsed}')
+			# print(r.content)
+			response = dnsPayload(r.content)
+			print(response)
+
+if __name__ == '__main__':
+	main()
